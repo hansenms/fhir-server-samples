@@ -80,6 +80,11 @@ namespace Microsoft.Health
                 string clientId = System.Environment.GetEnvironmentVariable("ClientId");
                 string clientSecret = System.Environment.GetEnvironmentVariable("ClientSecret");
                 Uri fhirServerUrl = new Uri(System.Environment.GetEnvironmentVariable("FhirServerUrl"));
+                bool addProvenance;
+                if (!Boolean.TryParse(System.Environment.GetEnvironmentVariable("AddProvenance"), out addProvenance))
+                {
+                    addProvenance = false;
+                }
 
                 int maxDegreeOfParallelism;
                 if (!int.TryParse(System.Environment.GetEnvironmentVariable("MaxDegreeOfParallelism"), out maxDegreeOfParallelism))
@@ -159,6 +164,50 @@ namespace Microsoft.Health
                     else
                     {
                         log.LogInformation($"Uploaded /{resource_type}/{id}");
+                        if (addProvenance)
+                        {
+                            var jsonResult = JObject.Parse(await uploadResult.Content.ReadAsStringAsync());
+                            var resourceId = jsonResult["id"].ToString();
+                            var lastUpdated = DateTime.Parse(jsonResult["meta"]["lastUpdated"].ToString());
+                            var versionId = jsonResult["meta"]["versionId"].ToString();
+
+                            JObject provenance = new JObject();
+                            provenance["resourceType"] = "Provenance";
+                            provenance["target"] = new JObject();
+                            provenance["target"]["reference"] = $"{resource_type}/{resourceId}/_history/{versionId}";
+                            provenance["recorded"] = lastUpdated.ToString("o");
+                            var agents = new JArray();
+                            agents.Add(new JObject());
+                            provenance["agent"] = agents;
+                            provenance["agent"][0] = new JObject();
+                            provenance["agent"][0]["whoUri"] = "https://github.com/Microsoft/fhir-server-samples/tree/master/src/FhirImporter";
+
+                            HttpResponseMessage provenanceResult = await Policy
+                                .HandleResult<HttpResponseMessage>(response => !response.IsSuccessStatusCode)
+                                .WaitAndRetryAsync(pollyDelays, (result, timeSpan, retryCount, context) =>
+                                {
+                                    log.LogWarning($"Provenance request failed with {result.Result.StatusCode}. Waiting {timeSpan} before next retry. Retry attempt {retryCount}");
+                                })
+                                .ExecuteAsync(() => {                            
+                                    var message = new HttpRequestMessage(HttpMethod.Post, new Uri(fhirServerUrl, "/Provenance"));
+                                    message.Content = new StringContent(provenance.ToString(), Encoding.UTF8, "application/json");
+                                    message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authResult.AccessToken);
+                                    return httpClient.SendAsync(message);
+                                });
+
+                                if (!provenanceResult.IsSuccessStatusCode)
+                                {
+                                    string resultContent = await uploadResult.Content.ReadAsStringAsync();
+                                    log.LogError(resultContent);
+
+                                    // Throwing a generic exception here. This will leave the blob in storage and retry.
+                                    throw new Exception($"Unable to upload Provenance to server. Error code {uploadResult.StatusCode}");
+                                }
+                                else
+                                {
+                                    log.LogInformation($"Uploaded /Provenance");
+                                }
+                        }
                     }
                 },
                     new ExecutionDataflowBlockOptions
